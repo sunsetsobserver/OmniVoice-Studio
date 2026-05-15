@@ -20,6 +20,38 @@ from core import event_bus
 router = APIRouter()
 logger = logging.getLogger("omnivoice.generate")
 
+_INSTRUCT_VALIDATION_MARKERS = (
+    "Unsupported instruct items found",
+    "Cannot mix Chinese dialect and English accent",
+    "Conflicting instruct items within the same category",
+)
+
+
+def _is_instruct_validation_error(exc: BaseException) -> bool:
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, ValueError) and any(marker in str(cur) for marker in _INSTRUCT_VALIDATION_MARKERS):
+            return True
+        if any(marker in str(cur) for marker in _INSTRUCT_VALIDATION_MARKERS):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def _validate_generation_instruct(text: str, instruct: Optional[str]) -> None:
+    if not instruct or not instruct.strip():
+        return
+
+    # Reuse OmniVoice's own whitelist before the expensive generation call, so
+    # user input mistakes return a 400 instead of being reported as model death.
+    from omnivoice.utils.voice_design import _ZH_RE, resolve_instruct
+
+    use_zh = bool(text and _ZH_RE.search(text))
+    resolve_instruct(instruct, use_zh=use_zh)
+
+
 def _run_inference(
     model, text, language, ref_audio_path, ref_text, instruct, duration,
     num_step, guidance_scale, speed, t_shift, denoise,
@@ -30,6 +62,8 @@ def _run_inference(
     try:
         if used_seed is not None:
             torch.manual_seed(used_seed)
+
+        _validate_generation_instruct(text, instruct)
 
         kwargs = {}
         if t_shift is not None: kwargs["t_shift"] = t_shift
@@ -53,6 +87,8 @@ def _run_inference(
         # Don't wrap validation errors in OOM message
         raise e
     except Exception as e:
+        if _is_instruct_validation_error(e):
+            raise ValueError(str(e)) from e
         import gc
         gc.collect()
         if torch.backends.mps.is_available():
